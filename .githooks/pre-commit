@@ -1,0 +1,58 @@
+#!/bin/sh
+set -e
+
+if ! command -v astyle >/dev/null; then
+    echo "❌ astyle not found" >&2
+    exit 1
+fi
+
+TMP_STAGED=$(mktemp)
+trap 'rm -f "$TMP_STAGED"' EXIT
+
+git diff --cached --name-only --diff-filter=AM |
+    grep -E '\.(c|cpp|cc|cxx|h|hpp|hxx)$' > "$TMP_STAGED" || true
+
+[ ! -s "$TMP_STAGED" ] && exit 0
+
+TMP_TO_BACKUP=$(mktemp)
+trap 'rm -f "$TMP_TO_BACKUP"' EXIT
+
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    if ! git diff --quiet -- "$file"; then
+        printf '%s\n' "$file"
+    fi
+done < "$TMP_STAGED" > "$TMP_TO_BACKUP"
+
+
+BACKUP_DIR=""
+if [ -s "$TMP_TO_BACKUP" ]; then
+    BACKUP_DIR="$(mktemp -d)"
+    trap 'rm -rf "$BACKUP_DIR"' EXIT
+
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        mkdir -p "$BACKUP_DIR/$(dirname "$file")"
+        cp "$file" "$BACKUP_DIR/$file"
+    done < "$TMP_TO_BACKUP"
+fi
+
+
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    if [ -f "$file" ]; then
+        git restore $file
+        clang-format -i "$file" >/dev/null
+        git add $file
+    fi
+done < "$TMP_STAGED"
+
+
+if [ -n "$BACKUP_DIR" ] && [ -s "$TMP_TO_BACKUP" ]; then
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        cp "$BACKUP_DIR/$file" "$file"
+    done < "$TMP_TO_BACKUP"
+fi
+
+echo "✅ Staged files formatted."
