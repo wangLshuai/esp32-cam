@@ -2,6 +2,7 @@ BasedOnStyle: Google
 IndentWidth: 4
 UseTab: Never
 TabWidth: 4
+IncludeBlocks: Preserve
 
 BreakBeforeBraces: Custom
 
