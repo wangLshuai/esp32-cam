@@ -1,5 +1,5 @@
 build/
-dependencies.lock
 sdkconfig
 sdkconfig.old
 .cache/
+managed_components/
