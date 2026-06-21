@@ -15,5 +15,8 @@ git config core.hooksPath .githooks
 
 # run
 idf.py -p PORT flash
+
+* wifi 配置
+如果没有编译前配置默认的 ssid 和 password, 需要使用 esp ble prov app 蓝牙配网
 python view.py
 ![img](./imgs/view.png)
