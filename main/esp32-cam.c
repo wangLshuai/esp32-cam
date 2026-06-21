@@ -4,12 +4,15 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "freertos/idf_additions.h"
 #include "mdns.h"
 #include "nvs_flash.h"
 #include "protocol_examples_common.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
+
+#include <string.h>
 
 #define TAG "esp32-cam"
 #define PORT 3488
@@ -53,7 +56,7 @@ static camera_config_t camera_config = {
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
 
-    .pixel_format = PIXFORMAT_RGB565,  // YUV422,GRAYSCALE,RGB565,JPEG
+    .pixel_format = PIXFORMAT_JPEG,  // YUV422,GRAYSCALE,RGB565,JPEG
     .frame_size =
         FRAMESIZE_QVGA,  // QQVGA-UXGA, For ESP32, do not use sizes above QVGA when not JPEG. The performance of the
                          // ESP32-S series has improved a lot, but JPEG mode always gives better frame rates.
@@ -141,6 +144,8 @@ void app_main(void)
             ESP_LOGE(TAG, "setsockopt TCP_NODELAY failed: %s", strerror(errno));
         }
         ssize_t ret;
+        TickType_t xLastWakeTime = xTaskGetTickCount();
+        const TickType_t xFrequency = pdMS_TO_TICKS(40);
         do {
             ESP_LOGI(TAG, "Taking picture...");
             int64_t start = esp_timer_get_time();
@@ -152,14 +157,28 @@ void app_main(void)
             if (pic) {
                 ESP_LOGI(TAG, "Picture taken! duration:%lld us .Its size was: %zu widty:%zu height:%zu bytes,format:%d",
                          end - start, pic->len, pic->width, pic->height, pic->format);
-                // char buf[64];
-                // size_t n = snprintf(buf,64,"bytes:%u\n",pic->len);
-                start = esp_timer_get_time();
-                ret = send(sock, pic->buf, pic->len, 0);
-                end = esp_timer_get_time();
-                ESP_LOGI(TAG, "send n:%d duration:%lld", ret, end - start);
+
+                /* length(4B BE) + width(2B BE) + height(2B BE) + format(1B) = 9 bytes */
+                uint8_t header[9];
+                uint32_t len_be = htonl(pic->len);
+                uint16_t width_be = htons(pic->width);
+                uint16_t height_be = htons(pic->height);
+                memcpy(header, &len_be, 4);
+                memcpy(header + 4, &width_be, 2);
+                memcpy(header + 6, &height_be, 2);
+                header[8] = pic->format;
+
+                int64_t send_start = esp_timer_get_time();
+                ret = send(sock, header, sizeof(header), 0);
+                if (ret > 0) {
+                    ret = send(sock, pic->buf, pic->len, 0);
+                }
+                int64_t send_end = esp_timer_get_time();
+                ESP_LOGI(TAG, "send n:%d duration:%lld", ret, send_end - send_start);
                 esp_camera_fb_return(pic);
             }
+            //  25fps (40ms)
+            vTaskDelayUntil(&xLastWakeTime, xFrequency);
         } while (ret > 0);
         if (sock > 0) {
             close(sock);
