@@ -1,0 +1,29 @@
+menu "Example Configuration"
+
+        config WIFI_SSID
+        string "wifi default ssid"
+        default ""
+        help
+            wifi default ssid
+
+        config WIFI_PASSWORD
+        string "wifi default password"
+        default ""
+        help
+            wifi default password
+
+
+        config WIFI_PROV_BUTTON_GPIO
+        int "gpio pin"
+        default 0
+        help
+            long push this key enter wifi provisioning mode.
+
+
+        config WIFI_PROV_BUTTON_ACTIVE_LEVEL
+        int "push level"
+        default 0
+        help
+            long push enter wifi provisioning mode.
+
+endmenu
