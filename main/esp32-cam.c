@@ -1,12 +1,14 @@
 #include "driver/gpio.h"
 #include "esp_camera.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
+#include "freertos/projdefs.h"
 #include "mdns.h"
 #include "nvs_flash.h"
 #include "wifi_provisioning/manager.h"
@@ -15,6 +17,7 @@
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 
+#include <fcntl.h>
 #include <string.h>
 
 #define TAG "esp32-cam"
@@ -364,8 +367,12 @@ void app_main(void)
     // Start mDNS service
     start_mdns_service();
 
-    // Create TCP listening socket
-    int listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    // Initialize camera
+    ESP_ERROR_CHECK(init_camera());
+    ESP_LOGI(TAG, "Camera initialized");
+
+    // Create UDP socket
+    int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (listen_sock < 0) {
         ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
         vTaskDelete(NULL);
@@ -387,80 +394,121 @@ void app_main(void)
         ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
         goto CLEAN_UP;
     }
-    ESP_LOGI(TAG, "Socket bound, port %d", PORT);
-
-    err = listen(listen_sock, 1);
-    if (err != 0) {
-        ESP_LOGE(TAG, "Error occurred during listen: errno %d", errno);
+    // Non-blocking recvfrom
+    int flags = fcntl(listen_sock, F_GETFL, 0);
+    if (flags < 0 || fcntl(listen_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
+        ESP_LOGE(TAG, "fcntl O_NONBLOCK failed: %s", strerror(errno));
         goto CLEAN_UP;
     }
+    ESP_LOGI(TAG, "Socket bound, port %d (UDP, non-blocking)", PORT);
 
-    if (ESP_OK != init_camera()) {
-        goto CLEAN_UP;
-    }
+    // Chunk buffer: chunk_hdr(8B) + max payload per chunk(1400B) = 1408B
+#define CHUNK_HDR_SIZE 8
+#define CHUNK_DATA_MAX 1400
+    static uint8_t s_chunk_buf[CHUNK_HDR_SIZE + CHUNK_DATA_MAX];
+
+    struct sockaddr_in peer_addr;
+    memset(&peer_addr, 0, sizeof(peer_addr));
+    bool have_peer = false;
+    uint32_t frame_id = 0;
+
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xFrequency = pdMS_TO_TICKS(100);
 
     while (1) {
-        ESP_LOGI(TAG, "Socket listening");
+        // ---- Non-blocking recvfrom: discover / refresh peer ----
+        uint8_t rx_buf[64];
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        ssize_t rx_len = recvfrom(listen_sock, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&from_addr, &from_len);
+        if (rx_len >= 0) {
+            memcpy(&peer_addr, &from_addr, sizeof(peer_addr));
+            have_peer = true;
+            ESP_LOGI(TAG, "Got packet from %s:%d, %d bytes", inet_ntoa(from_addr.sin_addr), ntohs(from_addr.sin_port),
+                     rx_len);
+            xLastWakeTime = xTaskGetTickCount();
+        }
 
-        struct sockaddr_in peer_addr;
-        socklen_t addr_len = sizeof(peer_addr);
-        int sock = accept(listen_sock, (struct sockaddr *)&peer_addr, &addr_len);
-        if (sock < 0) {
-            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+        if (!have_peer) {
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        int nodelay = 1;
-        err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        if (err != 0) {
-            ESP_LOGE(TAG, "setsockopt TCP_NODELAY failed: %s", strerror(errno));
-        }
-        ssize_t ret;
-        TickType_t xLastWakeTime = xTaskGetTickCount();
-        const TickType_t xFrequency = pdMS_TO_TICKS(100);
-        do {
-            ESP_LOGI(TAG, "Taking picture...");
-            int64_t start = esp_timer_get_time();
-            camera_fb_t * pic = esp_camera_fb_get();
 
-            int64_t end = esp_timer_get_time();
-            ret = 0;
-            if (pic) {
-                ESP_LOGI(TAG,
-                         "Picture taken! duration:%lld us. size: %zu "
-                         "width:%zu height:%zu format:%d",
-                         end - start, pic->len, pic->width, pic->height, pic->format);
-
-                /* header: length(4B BE) + width(2B BE) + height(2B BE)
-                 * + format(1B) = 9 bytes */
-                uint8_t header[9];
-                uint32_t len_be = htonl(pic->len);
-                uint16_t width_be = htons(pic->width);
-                uint16_t height_be = htons(pic->height);
-                memcpy(header, &len_be, 4);
-                memcpy(header + 4, &width_be, 2);
-                memcpy(header + 6, &height_be, 2);
-                header[8] = pic->format;
-
-                int64_t send_start = esp_timer_get_time();
-                ret = send(sock, header, sizeof(header), 0);
-                if (ret > 0) {
-                    ret = send(sock, pic->buf, pic->len, 0);
-                    if (ret <= 0) {
-                        ESP_LOGI(TAG, "ret:%d\n", ret);
-                    }
-                } else {
-                    ESP_LOGI(TAG, "ret:%d\n", ret);
-                }
-                int64_t send_end = esp_timer_get_time();
-                ESP_LOGI(TAG, "send n:%d duration:%lld", ret, send_end - send_start);
-                esp_camera_fb_return(pic);
-            }
-            // 25fps (40ms)
+        // ---- Capture frame ----
+        camera_fb_t * pic = esp_camera_fb_get();
+        if (!pic) {
             vTaskDelayUntil(&xLastWakeTime, xFrequency);
-        } while (ret > 0);
-        if (sock > 0) {
-            close(sock);
+            continue;
         }
+
+        ESP_LOGI(TAG, "Pic: %zuB %zux%zu fmt=%d", pic->len, pic->width, pic->height, pic->format);
+
+        // Build 9-byte frame header: length(4B) + width(2B) + height(2B) + format(1B)
+        uint8_t frm_hdr[9];
+        uint32_t len_be = htonl(pic->len);
+        uint16_t width_be = htons(pic->width);
+        uint16_t height_be = htons(pic->height);
+        memcpy(frm_hdr, &len_be, 4);
+        memcpy(frm_hdr + 4, &width_be, 2);
+        memcpy(frm_hdr + 6, &height_be, 2);
+        frm_hdr[8] = pic->format;
+
+        // Total payload = 9-byte frame header + JPEG data
+        uint32_t total_payload = 9 + pic->len;
+        uint16_t total_chunks = (total_payload + CHUNK_DATA_MAX - 1) / CHUNK_DATA_MAX;
+        uint32_t offset = 0;
+
+        // ---- Send frame in MTU-sized chunks ----
+        for (uint16_t seq = 0; seq < total_chunks; seq++) {
+            // Chunk header: frame_id(4B) + chunk_seq(2B) + total_chunks(2B)
+            uint32_t fid_be = htonl(frame_id);
+            uint16_t seq_be = htons(seq);
+            uint16_t total_be = htons(total_chunks);
+            memcpy(s_chunk_buf, &fid_be, 4);
+            memcpy(s_chunk_buf + 4, &seq_be, 2);
+            memcpy(s_chunk_buf + 6, &total_be, 2);
+
+            // How much data in this chunk
+            uint16_t copy_len = CHUNK_DATA_MAX;
+            if (offset + copy_len > total_payload) {
+                copy_len = total_payload - offset;
+            }
+
+            // Copy data from frame header (first 9 bytes) then JPEG payload
+            if (offset < 9) {
+                uint16_t hdr_off = offset;
+                uint16_t hdr_copy = (copy_len <= 9 - hdr_off) ? copy_len : (9 - hdr_off);
+                memcpy(s_chunk_buf + CHUNK_HDR_SIZE, frm_hdr + hdr_off, hdr_copy);
+                if (copy_len > hdr_copy) {
+                    memcpy(s_chunk_buf + CHUNK_HDR_SIZE + hdr_copy, pic->buf, copy_len - hdr_copy);
+                }
+            } else {
+                memcpy(s_chunk_buf + CHUNK_HDR_SIZE, pic->buf + (offset - 9), copy_len);
+            }
+
+            ssize_t sent = sendto(listen_sock, s_chunk_buf, CHUNK_HDR_SIZE + copy_len, 0, (struct sockaddr *)&peer_addr,
+                                  sizeof(peer_addr));
+            if (sent < 0) {
+                ESP_LOGW(TAG, "sendto chunk %d/%d failed: %s (errno=%d)", seq, total_chunks, strerror(errno), errno);
+                if (errno == ENOMEM) {
+                    printf("Free SPIRAM: %zu, largest free block: %zu\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                           heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+                }
+
+                vTaskDelay(pdMS_TO_TICKS(50));
+                break;
+            }
+
+            offset += copy_len;
+            // Yield to let lwIP drain pbufs between chunks
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        frame_id++;
+        esp_camera_fb_return(pic);
+
+        // Target frame rate
+        vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 
 CLEAN_UP:

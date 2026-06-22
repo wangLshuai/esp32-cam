@@ -1,4 +1,5 @@
 import socket
+import time
 from struct import unpack
 from PIL import Image, ImageTk
 import tkinter as tk
@@ -12,7 +13,11 @@ FMT_GRAYSCALE = 3
 FMT_JPEG = 4
 FMT_RGB888 = 5
 
-HEADER_SIZE = 9  # length(4B) + width(2B) + height(2B) + format(1B)
+FRAME_HEADER_SIZE = 9   # length(4B) + width(2B) + height(2B) + format(1B)
+CHUNK_HEADER_SIZE = 8   # frame_id(4B) + chunk_seq(2B) + total_chunks(2B)
+
+# Maximum frames to keep in reassembly buffer (prevent memory leak)
+MAX_PENDING_FRAMES = 4
 
 
 def rgb565_to_image(data, width, height):
@@ -43,84 +48,109 @@ def decode_frame(width, height, fmt, payload):
         raise ValueError(f"Unsupported format: {fmt}")
 
 
-def extract_latest_frame(buf):
-    """Extract all complete frames from buf, return the latest one and leftover bytes.
-    Returns (width, height, fmt, payload, remaining_buf) or None if no complete frame."""
-    latest = None
-    while len(buf) >= HEADER_SIZE:
-        length, width, height, fmt = unpack('>IHHB', buf[:HEADER_SIZE])
-        frame_total = HEADER_SIZE + length
-        if len(buf) < frame_total:
-            break  # incomplete frame, wait for more data
-        payload = bytes(buf[HEADER_SIZE:frame_total])
-        latest = (width, height, fmt, payload)
-        buf = buf[frame_total:]  # discard old frame, keep scanning
-    return latest, buf
-
-
 def connect_and_receive_image(ip, port, label):
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        client_socket.connect((ip, port))
-        print("Connected")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', 0))  # bind to any available port so we can receive
+    local_port = sock.getsockname()[1]
+    print(f"Local UDP port: {local_port}")
 
-        buffer = bytearray()
+    # Send "hello" so ESP32 learns our address
+    sock.sendto("hello".encode("utf-8"), (ip, port))
+    print(f"Sent hello to {ip}:{port}")
 
-        while True:
-            # ---- 1) Non-blocking: drain all available data into buffer ----
-            client_socket.setblocking(False)
+    pending = {}          # frame_id -> {'total': N, 'chunks': {seq: bytes}}
+    last_displayed = -1  # last frame_id we displayed
+
+    def store_chunk(raw):
+        """Parse and store a chunk datagram. Returns frame_id if chunk stored."""
+        if len(raw) < CHUNK_HEADER_SIZE:
+            return None
+        frame_id, chunk_seq, total_chunks = unpack('>IHH', raw[:CHUNK_HEADER_SIZE])
+        chunk_data = raw[CHUNK_HEADER_SIZE:]
+
+        if frame_id <= last_displayed:
+            return None
+
+        if frame_id not in pending:
+            pending[frame_id] = {'total': total_chunks, 'chunks': {}, 'time': time.time()}
+        pending[frame_id]['chunks'][chunk_seq] = chunk_data
+        pending[frame_id]['time'] = time.time()
+        return frame_id
+
+    def try_reassemble():
+        """Check for complete frames, return list of (fid, width, height, fmt, payload)."""
+        completed = []
+        for fid in sorted(pending.keys()):
+            info = pending[fid]
+            if len(info['chunks']) == info['total']:
+                parts = [info['chunks'][seq] for seq in range(info['total'])]
+                full_data = b''.join(parts)
+
+                if len(full_data) >= FRAME_HEADER_SIZE:
+                    length, width, height, fmt = unpack('>IHHB', full_data[:FRAME_HEADER_SIZE])
+                    payload = full_data[FRAME_HEADER_SIZE:FRAME_HEADER_SIZE + length]
+                    completed.append((fid, width, height, fmt, payload))
+        return completed
+
+    while True:
+        # ---- 1) Non-blocking: drain all available datagrams ----
+        sock.setblocking(False)
+        try:
+            while True:
+                dgram, _ = sock.recvfrom(65536)
+                store_chunk(dgram)
+        except BlockingIOError:
+            pass
+        finally:
+            sock.setblocking(True)
+
+        # ---- 2) If frame incomplete, block until we get enough chunks ----
+        completed = try_reassemble()
+        if not completed and pending:
+            sock.settimeout(0.5)  # ESP32 sends all chunks within ~15ms
+            deadline = time.time() + 0.5
             try:
-                while True:
-                    chunk = client_socket.recv(65536)
-                    if not chunk:
+                while time.time() < deadline:
+                    dgram = sock.recv(65536)
+                    store_chunk(dgram)
+                    completed = try_reassemble()
+                    if completed:
                         break
-                    buffer.extend(chunk)
-            except BlockingIOError:
+            except socket.timeout:
                 pass
-            finally:
-                client_socket.setblocking(True)
+            sock.settimeout(None)
 
-            # ---- 2) If no complete frame in buffer, do ONE blocking read ----
-            if len(buffer) < HEADER_SIZE:
-                chunk = client_socket.recv(HEADER_SIZE - len(buffer))
-                if not chunk:
-                    raise ConnectionError("Connection closed")
-                buffer.extend(chunk)
+        # ---- 3) Display the latest complete frame ----
+        if completed:
+            for fid, width, height, fmt, payload in completed:
+                if fid > last_displayed:
+                    try:
+                        img = decode_frame(width, height, fmt, payload)
+                        nchunks = pending.get(fid, {}).get('total', '?')
+                        print(f"\rFrame #{fid}: {width}x{height} fmt={fmt} size={len(payload):6d} chunks={nchunks}  ",
+                              end='', flush=True)
 
-            # ---- 3) Try to extract latest frame ----
-            result, buffer = extract_latest_frame(buffer)
+                        tk_img = ImageTk.PhotoImage(img)
+                        label.config(image=tk_img)
+                        label.image = tk_img
+                        last_displayed = fid
+                    except Exception as e:
+                        print(f"\nDecode error: {e}")
 
-            # If we have a header but not full payload, block until we get the rest
-            if result is None and len(buffer) >= HEADER_SIZE:
-                length = unpack('>I', buffer[:4])[0]
-                needed = HEADER_SIZE + length - len(buffer)
-                while needed > 0:
-                    chunk = client_socket.recv(needed)
-                    if not chunk:
-                        raise ConnectionError("Connection closed")
-                    buffer.extend(chunk)
-                    needed -= len(chunk)
-                result, buffer = extract_latest_frame(buffer)
+            for fid, *_ in completed:
+                pending.pop(fid, None)
 
-            # ---- 4) Display latest frame ----
-            if result:
-                width, height, fmt, payload = result
-                img = decode_frame(width, height, fmt, payload)
-                print(f"\rFrame: {width}x{height} fmt={fmt} size={len(payload):6d}", end='', flush=True)
+        # ---- 4) Clean up stale / old frames ----
+        now = time.time()
+        stale = [fid for fid, info in pending.items()
+                 if now - info['time'] > 2.0]
+        for fid in stale:
+            print(f"\nDropping stale frame #{fid} ({len(pending[fid]['chunks'])}/{pending[fid]['total']} chunks)")
+            pending.pop(fid)
 
-                tk_img = ImageTk.PhotoImage(img)
-                label.config(image=tk_img)
-                label.image = tk_img
-
-            # Safety: if buffer grows too large (e.g. corrupted stream), reset
-            if len(buffer) > 1_000_000:
-                print("\nBuffer overflow, resetting")
-                buffer = bytearray()
-
-    except Exception as e:
-        print(f"\nError: {e}")
-    finally:
-        client_socket.close()
+        while len(pending) > MAX_PENDING_FRAMES:
+            oldest = min(pending.keys())
+            pending.pop(oldest)
 
 
 if __name__ == '__main__':
