@@ -125,6 +125,7 @@ def connect_and_receive_image(ip, port, label):
 
 if __name__ == '__main__':
     root = tk.Tk()
+    root.wm_geometry("320x240")
     root.title("ESP32-CAM")
     label = tk.Label(root)
     label.pack()
