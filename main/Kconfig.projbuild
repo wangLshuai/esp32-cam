@@ -1,4 +1,4 @@
-menu "Example Configuration"
+menu "esp32-cam Configuration"
 
         config WIFI_SSID
         string "wifi default ssid"
@@ -11,6 +11,14 @@ menu "Example Configuration"
         default ""
         help
             wifi default password
+
+        config BLE_PROV_PREFIX
+        string "ble provision wifi service prefix"
+        default "esp32-cam"
+
+        config BLE_PROV_PROOF_POSSESSION
+        string "proof of possession pin"
+        default "abcd1234"
 
 
         config WIFI_PROV_BUTTON_GPIO

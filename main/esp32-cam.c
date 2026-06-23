@@ -3,11 +3,15 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
+#include "freertos/projdefs.h"
+#include "hal/gpio_types.h"
 #include "mdns.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "wifi_provisioning/manager.h"
 #include "wifi_provisioning/scheme_ble.h"
@@ -15,6 +19,7 @@
 #include "lwip/err.h"
 #include "lwip/sockets.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #define TAG "esp32-cam"
@@ -22,6 +27,7 @@
 
 // NVS keys for WiFi credentials
 #define NVS_WIFI_NAMESPACE "wifi_creds"
+#define NVS_KEY_FORCE_BLE "force_ble"
 #define NVS_KEY_SSID "ssid"
 #define NVS_KEY_PASS "password"
 
@@ -80,24 +86,63 @@ static esp_err_t nvs_load_wifi_creds(char * ssid, size_t ssid_len, char * passwo
     return err;
 }
 
-// ============================================================================
-// Button Long-Press Detection
-// ============================================================================
+static bool nvs_load_wifi_force_ble_flag()
+{
+    uint8_t force_ble_flag = 0;
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
 
-static bool is_button_long_pressed(void)
+    err = nvs_get_u8(handle, NVS_KEY_FORCE_BLE, &force_ble_flag);
+    if (err != ESP_OK) {
+        nvs_close(handle);
+        return 0;
+    }
+
+    nvs_close(handle);
+    return force_ble_flag;
+}
+
+static void nvs_set_wifi_force_ble_flag(uint8_t value)
+{
+    nvs_handle_t handle;
+    esp_err_t ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
+    if (ret == ESP_OK) {
+        if (ret == ESP_OK) {
+            nvs_set_u8(handle, NVS_KEY_FORCE_BLE, value);
+            nvs_commit(handle);
+            nvs_close(handle);
+            ESP_LOGI(TAG, "set nvs wifi force ble flag: %b", value);
+        }
+    } else {
+        nvs_close(handle);
+    }
+}
+
+static void button_init()
 {
     int gpio = CONFIG_WIFI_PROV_BUTTON_GPIO;
     int active_level = CONFIG_WIFI_PROV_BUTTON_ACTIVE_LEVEL;
 
     gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_ANYEDGE,
         .pin_bit_mask = (1ULL << gpio),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = (active_level == 0) ? GPIO_PULLUP_ENABLE : GPIO_PULLDOWN_ENABLE,
         .pull_down_en = (active_level == 0) ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
     };
     gpio_config(&io_conf);
+}
+// ============================================================================
+// Button Long-Press Detection
+// ============================================================================
 
+static bool is_key_long_pressed(void)
+{
+    int gpio = CONFIG_WIFI_PROV_BUTTON_GPIO;
+    int active_level = CONFIG_WIFI_PROV_BUTTON_ACTIVE_LEVEL;
     // Check if button is initially pressed
     if (gpio_get_level(gpio) != active_level) {
         return false;
@@ -204,6 +249,7 @@ static void wifi_event_handler(void * arg, esp_event_base_t event_base, int32_t 
 
 static esp_err_t wifi_connect(const char * ssid, const char * password)
 {
+    s_wifi_event_group = xEventGroupCreate();
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
 
@@ -220,6 +266,9 @@ static esp_err_t wifi_connect(const char * ssid, const char * password)
 
     // Block until connected (disconnect handler retries indefinitely)
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+    vEventGroupDelete(s_wifi_event_group);
     ESP_LOGI(TAG, "WiFi connected successfully");
     return ESP_OK;
 }
@@ -258,6 +307,7 @@ static void prov_event_handler(void * arg, esp_event_base_t event_base, int32_t 
 
 static void start_ble_provisioning(void)
 {
+    s_wifi_event_group = xEventGroupCreate();
     // Register WiFi event handler for reconnection after provisioning
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
@@ -276,14 +326,14 @@ static void start_ble_provisioning(void)
     // Generate unique service name from MAC address
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char service_name[14];
-    snprintf(service_name, sizeof(service_name), "PROV_%02X%02X%02X", mac[3], mac[4], mac[5]);
+    char service_name[32];
+    snprintf(service_name, sizeof(service_name), "%s_%02X%02X%02X", CONFIG_BLE_PROV_PREFIX, mac[3], mac[4], mac[5]);
 
     ESP_LOGI(TAG, "Starting BLE provisioning, service: %s", service_name);
 
     // Use Security 1 with a proof-of-possession PIN
     wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
-    const char * pop = "abcd1234";
+    const char * pop = CONFIG_BLE_PROV_PROOF_POSSESSION;
 
     ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, pop, service_name, NULL));
 
@@ -293,7 +343,45 @@ static void start_ble_provisioning(void)
 
     // Clean up provisioning manager
     wifi_prov_mgr_deinit();
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+
+    // Unegister provisioning event handler
+    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler);
+    vEventGroupDelete(s_wifi_event_group);
     ESP_LOGI(TAG, "BLE provisioning complete, WiFi connected");
+}
+
+static QueueHandle_t key_evt_queue = NULL;
+static void IRAM_ATTR key_isr_handler(void * arg)
+{
+    uint32_t gpio_num = (uint32_t)arg;
+    xQueueSendFromISR(key_evt_queue, &gpio_num, NULL);
+}
+
+void long_push_key_task()
+{
+    uint32_t io_num;
+    bool key_push = false;
+    uint8_t count = 0;
+    while (1) {
+        if (xQueueReceive(key_evt_queue, &io_num, pdMS_TO_TICKS(1000))) {
+            ESP_LOGI(TAG, "long push gpio %d key, restart enter force ble provision mode",
+                     CONFIG_WIFI_PROV_BUTTON_GPIO);
+            if (gpio_get_level(io_num) == CONFIG_WIFI_PROV_BUTTON_ACTIVE_LEVEL) {
+                key_push = true;
+            } else {
+                key_push = false;
+                count = 0;
+            }
+        }
+        if (key_push && count < 5) {
+            if (++count == 5) {
+                nvs_set_wifi_force_ble_flag(1);
+                esp_restart();
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -302,6 +390,8 @@ static void start_ble_provisioning(void)
 
 void app_main(void)
 {
+    key_evt_queue = xQueueCreate(4, sizeof(uint32_t));
+    button_init();
     // Initialize NVS first (required for WiFi credential storage)
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -319,6 +409,7 @@ void app_main(void)
         if (ret == ESP_OK) {
             nvs_set_str(handle, NVS_KEY_SSID, CONFIG_WIFI_SSID);
             nvs_set_str(handle, NVS_KEY_PASS, CONFIG_WIFI_PASSWORD);
+            nvs_set_u8(handle, NVS_KEY_FORCE_BLE, 0);
             nvs_commit(handle);
             nvs_close(handle);
             ESP_LOGI(TAG, "Initialized NVS with SSID: %s", strlen(CONFIG_WIFI_SSID) > 0 ? CONFIG_WIFI_SSID : "(empty)");
@@ -337,8 +428,18 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_cfg));
 
     // Determine provisioning path
-    bool force_ble = is_button_long_pressed();
-    s_wifi_event_group = xEventGroupCreate();
+    bool force_ble = is_key_long_pressed();
+
+    if (!force_ble) {
+        force_ble = nvs_load_wifi_force_ble_flag();
+    }
+
+    // 运行时，按键长按，则置位 nvs force ble flag key, 并重启。
+    xTaskCreatePinnedToCore(long_push_key_task, "push button task", ESP_TASK_MAIN_STACK, NULL, ESP_TASK_MAIN_PRIO, NULL,
+                            ESP_TASK_MAIN_CORE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(CONFIG_WIFI_PROV_BUTTON_GPIO, key_isr_handler, (void *)CONFIG_WIFI_PROV_BUTTON_GPIO);
+
     if (!force_ble) {
         char ssid[33] = {0};
         char password[65] = {0};
@@ -349,15 +450,14 @@ void app_main(void)
             ESP_LOGI(TAG, "No NVS credentials, starting BLE provisioning");
             force_ble = true;
         }
-    } else {
-        ESP_LOGI(TAG, "Button long press, forcing BLE provisioning");
     }
 
     if (force_ble) {
+        ESP_LOGI(TAG, "Button long press, forcing BLE provisioning");
         start_ble_provisioning();
     }
-    vEventGroupDelete(s_wifi_event_group);
 
+    nvs_set_wifi_force_ble_flag(0);
     // Disable WiFi power saving for better responsiveness
     esp_wifi_set_ps(WIFI_PS_NONE);
 
