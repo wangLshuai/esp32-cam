@@ -67,7 +67,8 @@ static esp_err_t nvs_save_wifi_creds(const char * ssid, const char * password)
     return err;
 }
 
-static esp_err_t nvs_load_wifi_creds(char * ssid, size_t ssid_len, char * password, size_t pass_len)
+static esp_err_t nvs_load_wifi_creds(char * ssid, size_t ssid_len,
+                                     char * password, size_t pass_len)
 {
     nvs_handle_t handle;
     esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
@@ -130,8 +131,10 @@ static void button_init()
         .intr_type = GPIO_INTR_ANYEDGE,
         .pin_bit_mask = (1ULL << gpio),
         .mode = GPIO_MODE_INPUT,
-        .pull_up_en = (active_level == 0) ? GPIO_PULLUP_ENABLE : GPIO_PULLDOWN_ENABLE,
-        .pull_down_en = (active_level == 0) ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
+        .pull_up_en =
+            (active_level == 0) ? GPIO_PULLUP_ENABLE : GPIO_PULLDOWN_ENABLE,
+        .pull_down_en =
+            (active_level == 0) ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
     };
     gpio_config(&io_conf);
 }
@@ -231,7 +234,8 @@ static void stop_mdns_service(void)
 // WiFi Event Handler (for both direct connect and post-provisioning reconnect)
 // ============================================================================
 
-static void wifi_event_handler(void * arg, esp_event_base_t event_base, int32_t event_id, void * event_data)
+static void wifi_event_handler(void * arg, esp_event_base_t event_base,
+                               int32_t event_id, void * event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         ESP_LOGI(TAG, "WiFi disconnected, reconnecting...");
@@ -250,12 +254,15 @@ static void wifi_event_handler(void * arg, esp_event_base_t event_base, int32_t 
 static esp_err_t wifi_connect(const char * ssid, const char * password)
 {
     s_wifi_event_group = xEventGroupCreate();
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                               &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                               &wifi_event_handler, NULL);
 
     wifi_config_t wifi_cfg = {0};
     strncpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, password, sizeof(wifi_cfg.sta.password) - 1);
+    strncpy((char *)wifi_cfg.sta.password, password,
+            sizeof(wifi_cfg.sta.password) - 1);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
@@ -265,9 +272,12 @@ static esp_err_t wifi_connect(const char * ssid, const char * password)
     ESP_LOGI(TAG, "Connecting to SSID: %s", ssid);
 
     // Block until connected (disconnect handler retries indefinitely)
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                        portMAX_DELAY);
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                 &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                 &wifi_event_handler);
     vEventGroupDelete(s_wifi_event_group);
     ESP_LOGI(TAG, "WiFi connected successfully");
     return ESP_OK;
@@ -277,7 +287,8 @@ static esp_err_t wifi_connect(const char * ssid, const char * password)
 // BLE Provisioning
 // ============================================================================
 
-static void prov_event_handler(void * arg, esp_event_base_t event_base, int32_t event_id, void * event_data)
+static void prov_event_handler(void * arg, esp_event_base_t event_base,
+                               int32_t event_id, void * event_data)
 {
     if (event_base == WIFI_PROV_EVENT) {
         switch (event_id) {
@@ -286,8 +297,10 @@ static void prov_event_handler(void * arg, esp_event_base_t event_base, int32_t 
                 break;
             case WIFI_PROV_CRED_RECV: {
                 wifi_sta_config_t * sta_cfg = (wifi_sta_config_t *)event_data;
-                ESP_LOGI(TAG, "Received credentials: SSID=%s", (const char *)sta_cfg->ssid);
-                nvs_save_wifi_creds((const char *)sta_cfg->ssid, (const char *)sta_cfg->password);
+                ESP_LOGI(TAG, "Received credentials: SSID=%s",
+                         (const char *)sta_cfg->ssid);
+                nvs_save_wifi_creds((const char *)sta_cfg->ssid,
+                                    (const char *)sta_cfg->password);
                 break;
             }
             case WIFI_PROV_CRED_FAIL:
@@ -309,11 +322,14 @@ static void start_ble_provisioning(void)
 {
     s_wifi_event_group = xEventGroupCreate();
     // Register WiFi event handler for reconnection after provisioning
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                               &wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                               &wifi_event_handler, NULL);
 
     // Register provisioning event handler
-    esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler, NULL);
+    esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+                               &prov_event_handler, NULL);
 
     // Configure the provisioning manager with BLE scheme
     wifi_prov_mgr_config_t prov_config = {
@@ -327,7 +343,8 @@ static void start_ble_provisioning(void)
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
     char service_name[32];
-    snprintf(service_name, sizeof(service_name), "%s_%02X%02X%02X", CONFIG_BLE_PROV_PREFIX, mac[3], mac[4], mac[5]);
+    snprintf(service_name, sizeof(service_name), "%s_%02X%02X%02X",
+             CONFIG_BLE_PROV_PREFIX, mac[3], mac[4], mac[5]);
 
     ESP_LOGI(TAG, "Starting BLE provisioning, service: %s", service_name);
 
@@ -335,19 +352,24 @@ static void start_ble_provisioning(void)
     wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
     const char * pop = CONFIG_BLE_PROV_PROOF_POSSESSION;
 
-    ESP_ERROR_CHECK(wifi_prov_mgr_start_provisioning(security, pop, service_name, NULL));
+    ESP_ERROR_CHECK(
+        wifi_prov_mgr_start_provisioning(security, pop, service_name, NULL));
 
     // Wait for WiFi to connect (IP obtained)
     ESP_LOGI(TAG, "Waiting for WiFi connection after provisioning...");
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
+                        portMAX_DELAY);
 
     // Clean up provisioning manager
     wifi_prov_mgr_deinit();
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler);
+    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                 &wifi_event_handler);
+    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                 &wifi_event_handler);
 
     // Unegister provisioning event handler
-    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID, &prov_event_handler);
+    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+                                 &prov_event_handler);
     vEventGroupDelete(s_wifi_event_group);
     ESP_LOGI(TAG, "BLE provisioning complete, WiFi connected");
 }
@@ -366,9 +388,12 @@ void long_push_key_task()
     uint8_t count = 0;
     while (1) {
         if (xQueueReceive(key_evt_queue, &io_num, pdMS_TO_TICKS(1000))) {
-            ESP_LOGI(TAG, "long push gpio %d key, restart enter force ble provision mode",
-                     CONFIG_WIFI_PROV_BUTTON_GPIO);
-            if (gpio_get_level(io_num) == CONFIG_WIFI_PROV_BUTTON_ACTIVE_LEVEL) {
+            ESP_LOGI(
+                TAG,
+                "long push gpio %d key, restart enter force ble provision mode",
+                CONFIG_WIFI_PROV_BUTTON_GPIO);
+            if (gpio_get_level(io_num) ==
+                CONFIG_WIFI_PROV_BUTTON_ACTIVE_LEVEL) {
                 key_push = true;
             } else {
                 key_push = false;
@@ -394,7 +419,8 @@ void app_main(void)
     button_init();
     // Initialize NVS first (required for WiFi credential storage)
     esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
+        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
@@ -404,7 +430,9 @@ void app_main(void)
     nvs_handle_t handle;
     ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG, "NVS wifi_creds namespace not found, initializing from menuconfig...");
+        ESP_LOGI(TAG,
+                 "NVS wifi_creds namespace not found, initializing from "
+                 "menuconfig...");
         ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
         if (ret == ESP_OK) {
             nvs_set_str(handle, NVS_KEY_SSID, CONFIG_WIFI_SSID);
@@ -412,7 +440,9 @@ void app_main(void)
             nvs_set_u8(handle, NVS_KEY_FORCE_BLE, 0);
             nvs_commit(handle);
             nvs_close(handle);
-            ESP_LOGI(TAG, "Initialized NVS with SSID: %s", strlen(CONFIG_WIFI_SSID) > 0 ? CONFIG_WIFI_SSID : "(empty)");
+            ESP_LOGI(
+                TAG, "Initialized NVS with SSID: %s",
+                strlen(CONFIG_WIFI_SSID) > 0 ? CONFIG_WIFI_SSID : "(empty)");
         }
     } else {
         nvs_close(handle);
@@ -435,15 +465,19 @@ void app_main(void)
     }
 
     // 运行时，按键长按，则置位 nvs force ble flag key, 并重启。
-    xTaskCreatePinnedToCore(long_push_key_task, "push button task", ESP_TASK_MAIN_STACK, NULL, ESP_TASK_MAIN_PRIO, NULL,
+    xTaskCreatePinnedToCore(long_push_key_task, "push button task",
+                            ESP_TASK_MAIN_STACK, NULL, ESP_TASK_MAIN_PRIO, NULL,
                             ESP_TASK_MAIN_CORE);
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(CONFIG_WIFI_PROV_BUTTON_GPIO, key_isr_handler, (void *)CONFIG_WIFI_PROV_BUTTON_GPIO);
+    gpio_isr_handler_add(CONFIG_WIFI_PROV_BUTTON_GPIO, key_isr_handler,
+                         (void *)CONFIG_WIFI_PROV_BUTTON_GPIO);
 
     if (!force_ble) {
         char ssid[33] = {0};
         char password[65] = {0};
-        if (nvs_load_wifi_creds(ssid, sizeof(ssid), password, sizeof(password)) == ESP_OK && strlen(ssid) > 0) {
+        if (nvs_load_wifi_creds(ssid, sizeof(ssid), password,
+                                sizeof(password)) == ESP_OK &&
+            strlen(ssid) > 0) {
             ESP_LOGI(TAG, "Using WiFi credentials from NVS");
             ESP_ERROR_CHECK(wifi_connect(ssid, password));
         } else {
@@ -482,7 +516,8 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Socket created");
 
-    int err = bind(listen_sock, (struct sockaddr *)&addr, sizeof(struct sockaddr));
+    int err =
+        bind(listen_sock, (struct sockaddr *)&addr, sizeof(struct sockaddr));
     if (err != 0) {
         ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
         goto CLEAN_UP;
@@ -504,13 +539,15 @@ void app_main(void)
 
         struct sockaddr_in peer_addr;
         socklen_t addr_len = sizeof(peer_addr);
-        int sock = accept(listen_sock, (struct sockaddr *)&peer_addr, &addr_len);
+        int sock =
+            accept(listen_sock, (struct sockaddr *)&peer_addr, &addr_len);
         if (sock < 0) {
             ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
             continue;
         }
         int nodelay = 1;
-        err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+        err = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                         sizeof(nodelay));
         if (err != 0) {
             ESP_LOGE(TAG, "setsockopt TCP_NODELAY failed: %s", strerror(errno));
         }
@@ -528,7 +565,8 @@ void app_main(void)
                 ESP_LOGI(TAG,
                          "Picture taken! duration:%lld us. size: %zu "
                          "width:%zu height:%zu format:%d",
-                         end - start, pic->len, pic->width, pic->height, pic->format);
+                         end - start, pic->len, pic->width, pic->height,
+                         pic->format);
 
                 /* header: length(4B BE) + width(2B BE) + height(2B BE)
                  * + format(1B) = 9 bytes */
@@ -552,7 +590,8 @@ void app_main(void)
                     ESP_LOGI(TAG, "ret:%d\n", ret);
                 }
                 int64_t send_end = esp_timer_get_time();
-                ESP_LOGI(TAG, "send n:%d duration:%lld", ret, send_end - send_start);
+                ESP_LOGI(TAG, "send n:%d duration:%lld", ret,
+                         send_end - send_start);
                 esp_camera_fb_return(pic);
             }
             // 25fps (40ms)

@@ -30,6 +30,6 @@ AllowShortIfStatementsOnASingleLine: true
 AllowShortLoopsOnASingleLine: true
 AllowShortFunctionsOnASingleLine: None
 
-ColumnLimit: 120
+ColumnLimit: 80
 ContinuationIndentWidth: 4
 MaxEmptyLinesToKeep: 1
