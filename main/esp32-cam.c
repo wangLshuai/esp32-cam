@@ -11,10 +11,6 @@
 #include "freertos/projdefs.h"
 #include "hal/gpio_types.h"
 #include "mdns.h"
-#include "nvs.h"
-#include "nvs_flash.h"
-#include "wifi_provisioning/manager.h"
-#include "wifi_provisioning/scheme_ble.h"
 
 #include "lwip/err.h"
 #include "lwip/sockets.h"
@@ -22,105 +18,16 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "ble.h"
+#include "config_in_nvs.h"
+
 #define TAG "esp32-cam"
 #define PORT 3488
-
-// NVS keys for WiFi credentials
-#define NVS_WIFI_NAMESPACE "wifi_creds"
-#define NVS_KEY_FORCE_BLE "force_ble"
-#define NVS_KEY_SSID "ssid"
-#define NVS_KEY_PASS "password"
 
 // Event group bits for WiFi connection synchronization
 #define WIFI_CONNECTED_BIT BIT0
 
 static EventGroupHandle_t s_wifi_event_group;
-;
-
-// ============================================================================
-// NVS WiFi Credential Storage
-// ============================================================================
-
-static esp_err_t nvs_save_wifi_creds(const char * ssid, const char * password)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_open failed: %d", err);
-        return err;
-    }
-    err = nvs_set_str(handle, NVS_KEY_SSID, ssid);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_set_str ssid failed: %d", err);
-        nvs_close(handle);
-        return err;
-    }
-    err = nvs_set_str(handle, NVS_KEY_PASS, password);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "nvs_set_str password failed: %d", err);
-        nvs_close(handle);
-        return err;
-    }
-    err = nvs_commit(handle);
-    nvs_close(handle);
-    ESP_LOGI(TAG, "WiFi credentials saved to NVS");
-    return err;
-}
-
-static esp_err_t nvs_load_wifi_creds(char * ssid, size_t ssid_len,
-                                     char * password, size_t pass_len)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-    size_t len = ssid_len;
-    err = nvs_get_str(handle, NVS_KEY_SSID, ssid, &len);
-    if (err != ESP_OK) {
-        nvs_close(handle);
-        return err;
-    }
-    len = pass_len;
-    err = nvs_get_str(handle, NVS_KEY_PASS, password, &len);
-    nvs_close(handle);
-    return err;
-}
-
-static bool nvs_load_wifi_force_ble_flag()
-{
-    uint8_t force_ble_flag = 0;
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    err = nvs_get_u8(handle, NVS_KEY_FORCE_BLE, &force_ble_flag);
-    if (err != ESP_OK) {
-        nvs_close(handle);
-        return 0;
-    }
-
-    nvs_close(handle);
-    return force_ble_flag;
-}
-
-static void nvs_set_wifi_force_ble_flag(uint8_t value)
-{
-    nvs_handle_t handle;
-    esp_err_t ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
-    if (ret == ESP_OK) {
-        if (ret == ESP_OK) {
-            nvs_set_u8(handle, NVS_KEY_FORCE_BLE, value);
-            nvs_commit(handle);
-            nvs_close(handle);
-            ESP_LOGI(TAG, "set nvs wifi force ble flag: %b", value);
-        }
-    } else {
-        nvs_close(handle);
-    }
-}
 
 static void button_init()
 {
@@ -283,97 +190,6 @@ static esp_err_t wifi_connect(const char * ssid, const char * password)
     return ESP_OK;
 }
 
-// ============================================================================
-// BLE Provisioning
-// ============================================================================
-
-static void prov_event_handler(void * arg, esp_event_base_t event_base,
-                               int32_t event_id, void * event_data)
-{
-    if (event_base == WIFI_PROV_EVENT) {
-        switch (event_id) {
-            case WIFI_PROV_START:
-                ESP_LOGI(TAG, "BLE provisioning started");
-                break;
-            case WIFI_PROV_CRED_RECV: {
-                wifi_sta_config_t * sta_cfg = (wifi_sta_config_t *)event_data;
-                ESP_LOGI(TAG, "Received credentials: SSID=%s",
-                         (const char *)sta_cfg->ssid);
-                nvs_save_wifi_creds((const char *)sta_cfg->ssid,
-                                    (const char *)sta_cfg->password);
-                break;
-            }
-            case WIFI_PROV_CRED_FAIL:
-                ESP_LOGE(TAG, "Provisioning credential attempt failed");
-                break;
-            case WIFI_PROV_CRED_SUCCESS:
-                ESP_LOGI(TAG, "Provisioning credentials applied successfully");
-                break;
-            case WIFI_PROV_END:
-                ESP_LOGI(TAG, "Provisioning service stopped");
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-static void start_ble_provisioning(void)
-{
-    s_wifi_event_group = xEventGroupCreate();
-    // Register WiFi event handler for reconnection after provisioning
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                               &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                               &wifi_event_handler, NULL);
-
-    // Register provisioning event handler
-    esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-                               &prov_event_handler, NULL);
-
-    // Configure the provisioning manager with BLE scheme
-    wifi_prov_mgr_config_t prov_config = {
-        .scheme = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
-        .app_event_handler = WIFI_PROV_EVENT_HANDLER_NONE,
-    };
-    ESP_ERROR_CHECK(wifi_prov_mgr_init(prov_config));
-
-    // Generate unique service name from MAC address
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    char service_name[32];
-    snprintf(service_name, sizeof(service_name), "%s_%02X%02X%02X",
-             CONFIG_BLE_PROV_PREFIX, mac[3], mac[4], mac[5]);
-
-    ESP_LOGI(TAG, "Starting BLE provisioning, service: %s", service_name);
-
-    // Use Security 1 with a proof-of-possession PIN
-    wifi_prov_security_t security = WIFI_PROV_SECURITY_1;
-    const char * pop = CONFIG_BLE_PROV_PROOF_POSSESSION;
-
-    ESP_ERROR_CHECK(
-        wifi_prov_mgr_start_provisioning(security, pop, service_name, NULL));
-
-    // Wait for WiFi to connect (IP obtained)
-    ESP_LOGI(TAG, "Waiting for WiFi connection after provisioning...");
-    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                        portMAX_DELAY);
-
-    // Clean up provisioning manager
-    wifi_prov_mgr_deinit();
-    esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                 &wifi_event_handler);
-    esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                 &wifi_event_handler);
-
-    // Unegister provisioning event handler
-    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
-                                 &prov_event_handler);
-    vEventGroupDelete(s_wifi_event_group);
-    ESP_LOGI(TAG, "BLE provisioning complete, WiFi connected");
-}
-
 static QueueHandle_t key_evt_queue = NULL;
 static void IRAM_ATTR key_isr_handler(void * arg)
 {
@@ -417,38 +233,11 @@ void app_main(void)
 {
     key_evt_queue = xQueueCreate(4, sizeof(uint32_t));
     button_init();
-    // Initialize NVS first (required for WiFi credential storage)
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    // Ensure wifi_creds namespace is initialized on first boot
-    nvs_handle_t handle;
-    ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READONLY, &handle);
-    if (ret == ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGI(TAG,
-                 "NVS wifi_creds namespace not found, initializing from "
-                 "menuconfig...");
-        ret = nvs_open(NVS_WIFI_NAMESPACE, NVS_READWRITE, &handle);
-        if (ret == ESP_OK) {
-            nvs_set_str(handle, NVS_KEY_SSID, CONFIG_WIFI_SSID);
-            nvs_set_str(handle, NVS_KEY_PASS, CONFIG_WIFI_PASSWORD);
-            nvs_set_u8(handle, NVS_KEY_FORCE_BLE, 0);
-            nvs_commit(handle);
-            nvs_close(handle);
-            ESP_LOGI(
-                TAG, "Initialized NVS with SSID: %s",
-                strlen(CONFIG_WIFI_SSID) > 0 ? CONFIG_WIFI_SSID : "(empty)");
-        }
-    } else {
-        nvs_close(handle);
-    }
+    nvs_config_init();
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    start_ble();
 
     // Create default WiFi STA netif
     esp_netif_create_default_wifi_sta();
@@ -484,11 +273,6 @@ void app_main(void)
             ESP_LOGI(TAG, "No NVS credentials, starting BLE provisioning");
             force_ble = true;
         }
-    }
-
-    if (force_ble) {
-        ESP_LOGI(TAG, "Button long press, forcing BLE provisioning");
-        start_ble_provisioning();
     }
 
     nvs_set_wifi_force_ble_flag(0);
